@@ -2,8 +2,9 @@ import io
 import os
 import sys
 
+import shutil
+
 from setuptools import setup, find_packages
-from setuptools_rust import Binding, RustExtension
 
 packages = [p for p in find_packages() if "tests" not in p]
 
@@ -25,10 +26,43 @@ with io.open(os.path.join(PACKAGE_PATH, VERSION)) as f:
 with io.open(README, 'rt', encoding='utf8') as f:
     readme = f.read()
 
-rust_extension = RustExtension(
-    RUST_EXTENSION_NAME, CARGO_FILE_PATH, debug="develop" in sys.argv,
-    args=["--verbose"] if "--verbose" in sys.argv else None,
-    binding=Binding.NoBinding)
+# The Rust library is loaded with ctypes (Binding.NoBinding): it does not link
+# against Python, so one wheel per platform serves every Python 3 version.
+# Set SNIPS_PREBUILT_DYLIB to a cross-compiled lib*.so to package it as a
+# py3-none-<platform> wheel (use --plat-name), without building Rust here.
+PREBUILT_DYLIB = os.environ.get("SNIPS_PREBUILT_DYLIB")
+cmdclass = {}
+setup_kwargs = {}
+if PREBUILT_DYLIB:
+    shutil.copy(PREBUILT_DYLIB,
+                os.path.join(PACKAGE_PATH, "dylib", "lib%s_rs.so" % PACKAGE_NAME))
+    rust_extensions = []
+    try:
+        from setuptools.command.bdist_wheel import bdist_wheel
+    except ImportError:
+        from wheel.bdist_wheel import bdist_wheel
+
+    from setuptools.dist import Distribution
+
+    class BinaryDistribution(Distribution):
+        # Platform wheel: files go to the wheel root (platlib)
+        def has_ext_modules(self):
+            return True
+
+    class PlatformWheel(bdist_wheel):
+        def get_tag(self):
+            _, _, plat = bdist_wheel.get_tag(self)
+            return "py3", "none", plat
+
+    cmdclass["bdist_wheel"] = PlatformWheel
+    setup_kwargs["distclass"] = BinaryDistribution
+else:
+    from setuptools_rust import Binding, RustExtension
+
+    rust_extensions = [RustExtension(
+        RUST_EXTENSION_NAME, CARGO_FILE_PATH, debug="develop" in sys.argv,
+        args=["--verbose"] if "--verbose" in sys.argv else None,
+        binding=Binding.NoBinding)]
 
 install_requires = [
     "pathlib>=1.0,<2.0; python_version<'3.4'"
@@ -52,7 +86,10 @@ setup(name=PACKAGE_NAME,
       ],
       install_requires=install_requires,
       extras_require={"test": ["future>=0.16,<0.18"]},
-      rust_extensions=[rust_extension],
+      rust_extensions=rust_extensions,
+      cmdclass=cmdclass,
+      package_data={PACKAGE_NAME: ["dylib/*"]},
       packages=packages,
       include_package_data=True,
-      zip_safe=False)
+      zip_safe=False,
+      **setup_kwargs)

@@ -1,0 +1,103 @@
+name: Build py3 wheels (armv6l, armv7l, aarch64)
+on:
+  push:
+    branches: [py3-wheels]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PKG: snips_nlu_utils
+  # Rust cdylib loaded with ctypes by the Python package
+  RUST_LIB: libsnips_nlu_utils_python_ffi.so
+
+jobs:
+  wheel:
+    name: "Wheel ${{ matrix.plat }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust_target: arm-unknown-linux-gnueabihf   # ARMv6 + VFP (Pi Zero W / Pi 1)
+            plat: linux_armv6l
+            base_image: dietpi:rpi_armv6_bookworm
+            cpu: arm1176
+            cpu_info: cpuinfo/raspberrypi_zero_w
+          - rust_target: armv7-unknown-linux-gnueabihf
+            plat: linux_armv7l
+            base_image: dietpi:rpi_armv7_bookworm
+            cpu: cortex-a7
+            cpu_info: cpuinfo/raspberrypi_3b
+          - rust_target: aarch64-unknown-linux-gnu
+            plat: linux_aarch64
+            base_image: dietpi:rpi_armv8_bookworm
+            cpu: cortex-a53
+            cpu_info: cpuinfo/raspberrypi_zero2_w_arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      # cross-rs images ship an old glibc, so the library runs on Buster to Trixie
+      - name: Cross-compile Rust library
+        working-directory: python/ffi
+        run: |
+          cross build --release --target ${{ matrix.rust_target }}
+          ls -la target/${{ matrix.rust_target }}/release/${RUST_LIB}
+
+      - name: Package py3-none wheel
+        working-directory: python
+        run: |
+          python3 -m pip install --upgrade setuptools wheel
+          SNIPS_PREBUILT_DYLIB=ffi/target/${{ matrix.rust_target }}/release/${RUST_LIB} \
+            python3 setup.py bdist_wheel --plat-name ${{ matrix.plat }}
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.plat == 'linux_armv6l'
+        with:
+          name: Cargo.lock
+          path: python/ffi/Cargo.lock
+
+      - name: Smoke-test with Python 3.11 in emulated Raspberry Pi
+        uses: pguyot/arm-runner-action@45f370abd7eed1b20397277e5ec0cb0a31adb026 # main 2026-09-26: Ubuntu 26.04 qemu fix, not in v2.6.5
+        with:
+          base_image: ${{ matrix.base_image }}
+          cpu: ${{ matrix.cpu }}
+          cpu_info: ${{ matrix.cpu_info }}
+          bind_mount_repository: true
+          shell: /bin/bash
+          commands: |
+            set -eux
+            REPO="$(pwd)"
+            apt-get update -y
+            apt-get install --no-install-recommends -y python3 python3-venv
+            python3 -m venv /tmp/test
+            /tmp/test/bin/pip install "$REPO"/python/dist/*.whl
+            (cd /tmp && /tmp/test/bin/python "$REPO/python/ci/smoke_test.py")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.plat }}
+          path: python/dist/*.whl
+
+  release:
+    name: "Attach wheels to release"
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: wheel
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
