@@ -9,6 +9,9 @@ on:
 env:
   PKG: snips_nlu_utils
   # Rust cdylib loaded with ctypes by the Python package
+  # Crates pinned below their latest semver-compatible release (name@version).
+  # rmp 0.8.15 removed rmp::decode::read_data_*, still used by rmp-serde 0.14.
+  CARGO_PINS: ""
   RUST_LIB: libsnips_nlu_utils_python_ffi.so
 
 jobs:
@@ -42,18 +45,27 @@ jobs:
         with:
           tool: cross
 
-      # cross-rs images ship an old glibc, so the library runs on Buster to Trixie
+      # No Cargo.lock upstream: resolve, then pin crates whose newer releases break the build
+      - name: Resolve dependencies
+        run: |
+          [ -f Cargo.lock ] || cargo generate-lockfile
+          for pin in ${CARGO_PINS}; do
+            cargo update -p "${pin%@*}" --precise "${pin#*@}"
+          done
+
+      # cross-rs images ship an old glibc, so the library runs on Buster to Trixie.
+      # The repository root is a Cargo workspace: output goes to ./target.
       - name: Cross-compile Rust library
         working-directory: python/ffi
         run: |
-          cross build --release --target ${{ matrix.rust_target }}
-          ls -la target/${{ matrix.rust_target }}/release/${RUST_LIB}
+          cross build --release --locked --target ${{ matrix.rust_target }}
+          ls -la "${GITHUB_WORKSPACE}/target/${{ matrix.rust_target }}/release/${RUST_LIB}"
 
       - name: Package py3-none wheel
         working-directory: python
         run: |
           python3 -m pip install --upgrade setuptools wheel
-          SNIPS_PREBUILT_DYLIB=ffi/target/${{ matrix.rust_target }}/release/${RUST_LIB} \
+          SNIPS_PREBUILT_DYLIB="${GITHUB_WORKSPACE}/target/${{ matrix.rust_target }}/release/${RUST_LIB}" \
             python3 setup.py bdist_wheel --plat-name ${{ matrix.plat }}
           ls -la dist
 
@@ -61,7 +73,7 @@ jobs:
         if: matrix.plat == 'linux_armv6l'
         with:
           name: Cargo.lock
-          path: python/ffi/Cargo.lock
+          path: Cargo.lock
 
       - name: Smoke-test with Python 3.11 in emulated Raspberry Pi
         uses: pguyot/arm-runner-action@45f370abd7eed1b20397277e5ec0cb0a31adb026 # main 2026-09-26: Ubuntu 26.04 qemu fix, not in v2.6.5
